@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstddef>
+#include <cstdlib>
 #include "faiss/IndexHNSW.h"
 
 #include <faiss/impl/AuxIndexStructures.h>
@@ -1280,6 +1281,14 @@ HNSWStats HNSW::search(
         const SearchParameters* params,
         const IndexHNSW* hnsw_index) const {
     HNSWStats stats;
+    if (const char* trace_limit_env =
+                std::getenv("LEANN_PROFILE_CANDIDATE_TRACE_LIMIT")) {
+        char* end = nullptr;
+        unsigned long limit = std::strtoul(trace_limit_env, &end, 10);
+        if (end != trace_limit_env) {
+            stats.candidate_trace_limit = static_cast<size_t>(limit);
+        }
+    }
     if (entry_point == -1) {
         return stats;
     }

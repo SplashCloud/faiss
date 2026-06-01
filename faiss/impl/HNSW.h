@@ -390,6 +390,18 @@ struct HNSW {
 };
 
 struct HNSWStats {
+    struct CandidateTrace {
+        size_t hop_id = 0;
+        idx_t candidate_id = -1;
+        idx_t parent_id = -1;
+        size_t candidate_degree = 0;
+        float pq_distance = -1.0f;
+        int pq_rank = -1;
+        float exact_distance = 0.0f;
+        bool was_selected_for_recompute = false;
+        bool was_recomputed = false;
+    };
+
     size_t n1 = 0; /// number of vectors searched
     size_t n2 =
             0; /// number of queries for which the candidate list is exhausted
@@ -420,6 +432,11 @@ struct HNSWStats {
     size_t level0_requested_nodes_total = 0;
     size_t level0_batch_size_bins[5] = {0, 0, 0, 0, 0};
     std::unordered_set<idx_t> level0_requested_nodes_unique;
+    size_t level0_iterations = 0;
+    size_t level0_beam_pops = 0;
+    size_t level0_neighbors_seen_total = 0;
+    size_t level0_unique_neighbors_seen_total = 0;
+    size_t level0_recompute_selected_total = 0;
 
     size_t zmq_distance_requests = 0;
     size_t zmq_distance_nodes_total = 0;
@@ -430,6 +447,8 @@ struct HNSWStats {
     double zmq_unpack_ms = 0.0;
 
     std::vector<idx_t> final_labels;
+    std::vector<CandidateTrace> candidate_trace;
+    size_t candidate_trace_limit = 0;
 
     // Track visited node counts
     std::unordered_map<idx_t, size_t> node_visit_counts;
@@ -460,6 +479,11 @@ struct HNSWStats {
         level0_requested_nodes_total = 0;
         std::fill(std::begin(level0_batch_size_bins), std::end(level0_batch_size_bins), 0);
         level0_requested_nodes_unique.clear();
+        level0_iterations = 0;
+        level0_beam_pops = 0;
+        level0_neighbors_seen_total = 0;
+        level0_unique_neighbors_seen_total = 0;
+        level0_recompute_selected_total = 0;
         zmq_distance_requests = 0;
         zmq_distance_nodes_total = 0;
         zmq_pack_ms = 0.0;
@@ -468,6 +492,8 @@ struct HNSWStats {
         zmq_recv_ms = 0.0;
         zmq_unpack_ms = 0.0;
         final_labels.clear();
+        candidate_trace.clear();
+        candidate_trace_limit = 0;
         // printf("Resetting node visit counts\n");
         // printf("Original size: %zu\n", node_visit_counts.size());
         node_visit_counts.clear();
@@ -508,6 +534,12 @@ struct HNSWStats {
         level0_requested_nodes_unique.insert(
                 other.level0_requested_nodes_unique.begin(),
                 other.level0_requested_nodes_unique.end());
+        level0_iterations += other.level0_iterations;
+        level0_beam_pops += other.level0_beam_pops;
+        level0_neighbors_seen_total += other.level0_neighbors_seen_total;
+        level0_unique_neighbors_seen_total +=
+                other.level0_unique_neighbors_seen_total;
+        level0_recompute_selected_total += other.level0_recompute_selected_total;
         zmq_distance_requests += other.zmq_distance_requests;
         zmq_distance_nodes_total += other.zmq_distance_nodes_total;
         zmq_pack_ms += other.zmq_pack_ms;
@@ -517,6 +549,18 @@ struct HNSWStats {
         zmq_unpack_ms += other.zmq_unpack_ms;
         final_labels.insert(
                 final_labels.end(), other.final_labels.begin(), other.final_labels.end());
+        if (candidate_trace_limit == 0) {
+            candidate_trace_limit = other.candidate_trace_limit;
+        }
+        if (candidate_trace_limit > 0 &&
+            candidate_trace.size() < candidate_trace_limit) {
+            size_t remaining = candidate_trace_limit - candidate_trace.size();
+            size_t take = std::min(remaining, other.candidate_trace.size());
+            candidate_trace.insert(
+                    candidate_trace.end(),
+                    other.candidate_trace.begin(),
+                    other.candidate_trace.begin() + take);
+        }
 
         // Combine node visit counts
         // printf("Two sizes: %zu, %zu\n",
@@ -552,6 +596,14 @@ struct HNSWStats {
         level0_requested_nodes_total += ids.size();
         level0_batch_size_bins[batch_bin(ids.size())]++;
         level0_requested_nodes_unique.insert(ids.begin(), ids.end());
+    }
+
+    void add_candidate_trace(const CandidateTrace& event) {
+        if (candidate_trace_limit == 0 ||
+            candidate_trace.size() >= candidate_trace_limit) {
+            return;
+        }
+        candidate_trace.push_back(event);
     }
 
     // Dump node visit frequency distribution to a file

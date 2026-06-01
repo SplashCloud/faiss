@@ -867,6 +867,14 @@ std::string IndexHNSW::get_last_hnsw_search_profile_json() const {
         out << s.level0_batch_size_bins[i];
     }
     out << "]";
+    out << ",\"level0_iterations\":" << s.level0_iterations;
+    out << ",\"level0_beam_pops\":" << s.level0_beam_pops;
+    out << ",\"level0_neighbors_seen_total\":"
+        << s.level0_neighbors_seen_total;
+    out << ",\"level0_unique_neighbors_seen_total\":"
+        << s.level0_unique_neighbors_seen_total;
+    out << ",\"level0_recompute_selected_total\":"
+        << s.level0_recompute_selected_total;
     size_t total_unique_nodes = s.upper_requested_nodes_unique.size();
     std::unordered_set<idx_t> all_recomputed_nodes =
             s.upper_requested_nodes_unique;
@@ -893,6 +901,37 @@ std::string IndexHNSW::get_last_hnsw_search_profile_json() const {
     for (size_t i = 0; i < s.final_labels.size(); i++) {
         if (i) out << ",";
         out << s.final_labels[i];
+    }
+    out << "]";
+    std::unordered_set<idx_t> final_label_set;
+    final_label_set.insert(s.final_labels.begin(), s.final_labels.end());
+    out << ",\"candidate_trace\":[";
+    for (size_t i = 0; i < s.candidate_trace.size(); i++) {
+        const auto& event = s.candidate_trace[i];
+        if (i) out << ",";
+        out << "{";
+        out << "\"hop_id\":" << event.hop_id;
+        out << ",\"candidate_id\":" << event.candidate_id;
+        out << ",\"parent_id\":" << event.parent_id;
+        out << ",\"candidate_degree\":" << event.candidate_degree;
+        out << ",\"is_high_degree\":"
+            << (event.candidate_degree >= hnsw.nb_neighbors(0) ? "true"
+                                                                : "false");
+        out << ",\"pq_distance\":" << event.pq_distance;
+        out << ",\"pq_rank\":" << event.pq_rank;
+        out << ",\"exact_distance_if_recomputed\":";
+        if (event.was_recomputed) {
+            out << event.exact_distance;
+        } else {
+            out << "null";
+        }
+        out << ",\"was_selected_for_recompute\":"
+            << (event.was_selected_for_recompute ? "true" : "false");
+        out << ",\"was_recomputed\":"
+            << (event.was_recomputed ? "true" : "false");
+        out << ",\"was_in_final_topk\":"
+            << (final_label_set.count(event.candidate_id) ? "true" : "false");
+        out << "}";
     }
     out << "]";
     out << ",\"n_queries\":" << s.n1;

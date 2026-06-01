@@ -41,6 +41,7 @@ typedef SSIZE_T ssize_t;
 #include <iostream>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include "faiss/impl/FaissAssert.h"
 #include "faiss/impl/pq.h"
 
@@ -542,6 +543,7 @@ int search_from_candidates(
     int nstep = 0;
 
     while (candidates.size() > 0) {
+        stats.level0_iterations++;
         // Process nodes based on strategy
         std::vector<int> beam_nodes;
         std::vector<float> beam_distances;
@@ -587,6 +589,9 @@ int search_from_candidates(
 
                 beam_nodes.push_back(v0);
                 beam_distances.push_back(d0);
+                stats.level0_beam_pops++;
+                stats.level0_neighbors_seen_total +=
+                        current_node_neighbors.size();
                 total_neighbors +=
                         current_node_neighbors.size() * pq_select_ratio;
                 beam_fetched_neighbors[v0] = std::move(current_node_neighbors);
@@ -629,6 +634,9 @@ int search_from_candidates(
                 }
                 beam_nodes.push_back(v0);
                 beam_distances.push_back(d0);
+                stats.level0_beam_pops++;
+                stats.level0_neighbors_seen_total +=
+                        current_node_neighbors.size();
                 total_neighbors +=
                         current_node_neighbors.size() * pq_select_ratio;
                 beam_fetched_neighbors[v0] = std::move(current_node_neighbors);
@@ -645,6 +653,9 @@ int search_from_candidates(
 
         threshold = res.threshold;
         std::set<idx_t> all_new_neighbors_set;
+        std::map<idx_t, idx_t> candidate_parent;
+        std::map<idx_t, float> candidate_pq_distance;
+        std::map<idx_t, int> candidate_pq_rank;
 
         // 2. Process neighbors of all nodes in the beam
         t_stage = getmillisecs();
@@ -657,6 +668,9 @@ int search_from_candidates(
                 assert(!vt.get(v1)); // Since the current_node_neighbors is
                                      // already filtered by vt
                 all_new_neighbors_set.insert(v1);
+                if (candidate_parent.find(v1) == candidate_parent.end()) {
+                    candidate_parent[v1] = v0;
+                }
             }
         }
 
@@ -664,6 +678,7 @@ int search_from_candidates(
                 all_new_neighbors_set.begin(), all_new_neighbors_set.end());
         std::vector<idx_t> nodes_to_compute;
         size_t n_new = unique_new_neighbors.size();
+        stats.level0_unique_neighbors_seen_total += n_new;
         dedupe_ms += getmillisecs() - t_stage;
 
         // Calculate PQ distances for unvisited neighbors and add to global PQ
@@ -694,6 +709,7 @@ int search_from_candidates(
             PQCandidateQueue local_pq_indices;
             for (size_t i = 0; i < aggregated_count; i++) {
                 assert(!vt.get(unique_new_neighbors[i]));
+                candidate_pq_distance[unique_new_neighbors[i]] = pq_dists_out[i];
                 local_pq_indices.push(
                         {pq_dists_out[i], unique_new_neighbors[i]});
                 pq_candidate_queue.push(
@@ -727,6 +743,8 @@ int search_from_candidates(
                 for (size_t i = 0;
                      i < num_to_select && i < sorted_candidates.size();
                      i++) {
+                    candidate_pq_rank[sorted_candidates[i].second] =
+                            static_cast<int>(i);
                     nodes_to_compute.push_back(sorted_candidates[i].second);
                     vt.set(sorted_candidates[i].second);
                 }
@@ -750,6 +768,7 @@ int search_from_candidates(
                                 "Node %ld already visited but appeared in PQ candidate queue. This suggests a duplicate entry or incorrect visited table state.",
                                 (long)top_pq.second);
                         nodes_to_compute.push_back(top_pq.second);
+                        candidate_pq_rank[top_pq.second] = i;
                         vt.set(top_pq.second);
                     }
                 } else {
@@ -761,6 +780,7 @@ int search_from_candidates(
 
                         if (!vt.get(top_pq.second)) {
                             nodes_to_compute.push_back(top_pq.second);
+                            candidate_pq_rank[top_pq.second] = i;
                             vt.set(top_pq.second);
                         }
                         popped_pq_nodes.push_back(std::move(top_pq));
@@ -792,6 +812,48 @@ int search_from_candidates(
         stats.record_level0_distance_batch(nodes_to_compute);
         qdis.distances_batch(nodes_to_compute, batch_distances);
         exact_distance_ms += getmillisecs() - t_stage;
+        stats.level0_recompute_selected_total += nodes_to_compute.size();
+
+        if (stats.candidate_trace_limit > 0 &&
+            stats.candidate_trace.size() < stats.candidate_trace_limit) {
+            std::unordered_map<idx_t, float> exact_distance_by_node;
+            exact_distance_by_node.reserve(nodes_to_compute.size());
+            for (size_t i = 0; i < nodes_to_compute.size(); i++) {
+                exact_distance_by_node[nodes_to_compute[i]] = batch_distances[i];
+            }
+            for (idx_t candidate_id : unique_new_neighbors) {
+                HNSWStats::CandidateTrace event;
+                size_t candidate_neighbors_begin = 0;
+                size_t candidate_neighbors_end = 0;
+                hnsw.neighbor_range(
+                        candidate_id,
+                        0,
+                        &candidate_neighbors_begin,
+                        &candidate_neighbors_end);
+                event.hop_id = stats.level0_iterations;
+                event.candidate_id = candidate_id;
+                event.parent_id = candidate_parent.count(candidate_id)
+                        ? candidate_parent[candidate_id]
+                        : -1;
+                event.candidate_degree =
+                        candidate_neighbors_end - candidate_neighbors_begin;
+                event.pq_distance = candidate_pq_distance.count(candidate_id)
+                        ? candidate_pq_distance[candidate_id]
+                        : -1.0f;
+                event.pq_rank = candidate_pq_rank.count(candidate_id)
+                        ? candidate_pq_rank[candidate_id]
+                        : -1;
+                auto exact_it = exact_distance_by_node.find(candidate_id);
+                event.was_selected_for_recompute =
+                        exact_it != exact_distance_by_node.end();
+                event.was_recomputed = event.was_selected_for_recompute;
+                event.exact_distance = event.was_recomputed ? exact_it->second : 0.0f;
+                stats.add_candidate_trace(event);
+                if (stats.candidate_trace.size() >= stats.candidate_trace_limit) {
+                    break;
+                }
+            }
+        }
 
         auto add_to_heap = [&](const size_t idx, const float dis) {
             if (!sel || sel->is_member(idx)) {
