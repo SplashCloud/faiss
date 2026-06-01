@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iterator>
 #include <memory>
 #include <queue>
 #include <unordered_map>
@@ -399,6 +400,37 @@ struct HNSWStats {
     size_t n_ios = 0;  /// number of neighbors fetched on demand
     size_t n_pq_calcs = 0;
 
+    double total_ms = 0.0;
+    double distance_computer_setup_ms = 0.0;
+    double upper_greedy_ms = 0.0;
+    double level0_total_ms = 0.0;
+    double level0_pop_fetch_ms = 0.0;
+    double level0_dedupe_ms = 0.0;
+    double level0_pq_ms = 0.0;
+    double level0_exact_distance_ms = 0.0;
+    double level0_heap_update_ms = 0.0;
+    double postprocess_ms = 0.0;
+
+    size_t upper_distance_batch_calls = 0;
+    size_t upper_requested_nodes_total = 0;
+    size_t upper_batch_size_bins[5] = {0, 0, 0, 0, 0};
+    std::unordered_set<idx_t> upper_requested_nodes_unique;
+
+    size_t level0_distance_batch_calls = 0;
+    size_t level0_requested_nodes_total = 0;
+    size_t level0_batch_size_bins[5] = {0, 0, 0, 0, 0};
+    std::unordered_set<idx_t> level0_requested_nodes_unique;
+
+    size_t zmq_distance_requests = 0;
+    size_t zmq_distance_nodes_total = 0;
+    double zmq_pack_ms = 0.0;
+    double zmq_connect_ms = 0.0;
+    double zmq_send_ms = 0.0;
+    double zmq_recv_ms = 0.0;
+    double zmq_unpack_ms = 0.0;
+
+    std::vector<idx_t> final_labels;
+
     // Track visited node counts
     std::unordered_map<idx_t, size_t> node_visit_counts;
 
@@ -410,6 +442,32 @@ struct HNSWStats {
         nfetch = 0;
         n_ios = 0;
         n_pq_calcs = 0;
+        total_ms = 0.0;
+        distance_computer_setup_ms = 0.0;
+        upper_greedy_ms = 0.0;
+        level0_total_ms = 0.0;
+        level0_pop_fetch_ms = 0.0;
+        level0_dedupe_ms = 0.0;
+        level0_pq_ms = 0.0;
+        level0_exact_distance_ms = 0.0;
+        level0_heap_update_ms = 0.0;
+        postprocess_ms = 0.0;
+        upper_distance_batch_calls = 0;
+        upper_requested_nodes_total = 0;
+        std::fill(std::begin(upper_batch_size_bins), std::end(upper_batch_size_bins), 0);
+        upper_requested_nodes_unique.clear();
+        level0_distance_batch_calls = 0;
+        level0_requested_nodes_total = 0;
+        std::fill(std::begin(level0_batch_size_bins), std::end(level0_batch_size_bins), 0);
+        level0_requested_nodes_unique.clear();
+        zmq_distance_requests = 0;
+        zmq_distance_nodes_total = 0;
+        zmq_pack_ms = 0.0;
+        zmq_connect_ms = 0.0;
+        zmq_send_ms = 0.0;
+        zmq_recv_ms = 0.0;
+        zmq_unpack_ms = 0.0;
+        final_labels.clear();
         // printf("Resetting node visit counts\n");
         // printf("Original size: %zu\n", node_visit_counts.size());
         node_visit_counts.clear();
@@ -424,6 +482,41 @@ struct HNSWStats {
         nfetch += other.nfetch;
         n_ios += other.n_ios;
         n_pq_calcs += other.n_pq_calcs;
+        total_ms += other.total_ms;
+        distance_computer_setup_ms += other.distance_computer_setup_ms;
+        upper_greedy_ms += other.upper_greedy_ms;
+        level0_total_ms += other.level0_total_ms;
+        level0_pop_fetch_ms += other.level0_pop_fetch_ms;
+        level0_dedupe_ms += other.level0_dedupe_ms;
+        level0_pq_ms += other.level0_pq_ms;
+        level0_exact_distance_ms += other.level0_exact_distance_ms;
+        level0_heap_update_ms += other.level0_heap_update_ms;
+        postprocess_ms += other.postprocess_ms;
+        upper_distance_batch_calls += other.upper_distance_batch_calls;
+        upper_requested_nodes_total += other.upper_requested_nodes_total;
+        for (size_t i = 0; i < 5; i++) {
+            upper_batch_size_bins[i] += other.upper_batch_size_bins[i];
+        }
+        upper_requested_nodes_unique.insert(
+                other.upper_requested_nodes_unique.begin(),
+                other.upper_requested_nodes_unique.end());
+        level0_distance_batch_calls += other.level0_distance_batch_calls;
+        level0_requested_nodes_total += other.level0_requested_nodes_total;
+        for (size_t i = 0; i < 5; i++) {
+            level0_batch_size_bins[i] += other.level0_batch_size_bins[i];
+        }
+        level0_requested_nodes_unique.insert(
+                other.level0_requested_nodes_unique.begin(),
+                other.level0_requested_nodes_unique.end());
+        zmq_distance_requests += other.zmq_distance_requests;
+        zmq_distance_nodes_total += other.zmq_distance_nodes_total;
+        zmq_pack_ms += other.zmq_pack_ms;
+        zmq_connect_ms += other.zmq_connect_ms;
+        zmq_send_ms += other.zmq_send_ms;
+        zmq_recv_ms += other.zmq_recv_ms;
+        zmq_unpack_ms += other.zmq_unpack_ms;
+        final_labels.insert(
+                final_labels.end(), other.final_labels.begin(), other.final_labels.end());
 
         // Combine node visit counts
         // printf("Two sizes: %zu, %zu\n",
@@ -432,6 +525,33 @@ struct HNSWStats {
         for (const auto& [node_id, count] : other.node_visit_counts) {
             node_visit_counts[node_id] += count;
         }
+    }
+
+    static size_t batch_bin(size_t batch_size) {
+        if (batch_size <= 1) {
+            return 0;
+        } else if (batch_size <= 4) {
+            return 1;
+        } else if (batch_size <= 16) {
+            return 2;
+        } else if (batch_size <= 64) {
+            return 3;
+        }
+        return 4;
+    }
+
+    void record_upper_distance_batch(const std::vector<idx_t>& ids) {
+        upper_distance_batch_calls++;
+        upper_requested_nodes_total += ids.size();
+        upper_batch_size_bins[batch_bin(ids.size())]++;
+        upper_requested_nodes_unique.insert(ids.begin(), ids.end());
+    }
+
+    void record_level0_distance_batch(const std::vector<idx_t>& ids) {
+        level0_distance_batch_calls++;
+        level0_requested_nodes_total += ids.size();
+        level0_batch_size_bins[batch_bin(ids.size())]++;
+        level0_requested_nodes_unique.insert(ids.begin(), ids.end());
     }
 
     // Dump node visit frequency distribution to a file

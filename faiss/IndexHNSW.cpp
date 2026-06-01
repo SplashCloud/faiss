@@ -13,11 +13,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 
 #include <limits>
 #include <memory>
 #include <queue>
 #include <random>
+#include <sstream>
+#include <unordered_set>
 
 #include <cstdint>
 
@@ -359,6 +362,7 @@ void hnsw_search(
     // ---- Addition: Accumulator for fetch counts ----
     size_t total_fetches_accum = 0;
     // ---- End Addition ----
+    HNSWStats combined_search_stats;
 
     idx_t check_period = InterruptCallback::get_period_hint(
             hnsw.max_level * index->d * efSearch);
@@ -374,6 +378,8 @@ void hnsw_search(
             // Select the appropriate distance computer based on use_recompute
             // flag
             std::unique_ptr<DistanceComputer> dis;
+            HNSWStats thread_search_stats;
+            double setup_start_ms = getmillisecs();
             if (index->is_recompute) {
                 // Use ZmqDistanceComputer for recomputation
                 dis.reset(new ZmqDistanceComputer(
@@ -385,6 +391,8 @@ void hnsw_search(
                 // Use standard distance computer
                 dis.reset(storage_distance_computer(index->storage));
             }
+            thread_search_stats.distance_computer_setup_ms +=
+                    getmillisecs() - setup_start_ms;
 
 #pragma omp for reduction(+ : n1, n2, ndis, nhops, total_fetches_accum) \
         schedule(guided)
@@ -397,12 +405,31 @@ void hnsw_search(
                 n2 += stats.n2;
                 ndis += stats.ndis;
                 nhops += stats.nhops;
+                thread_search_stats.combine(stats);
 
                 // ---- Addition: Accumulate fetch count ----
                 total_fetches_accum += dis->get_fetch_count();
                 // ---- End Addition ----
 
+                if (auto zmq_dis = dynamic_cast<ZmqDistanceComputer*>(dis.get())) {
+                    ZmqFetchStats zstats = zmq_dis->get_zmq_fetch_stats();
+                    thread_search_stats.zmq_distance_requests +=
+                            zstats.distance_requests;
+                    thread_search_stats.zmq_distance_nodes_total +=
+                            zstats.distance_nodes_total;
+                    thread_search_stats.zmq_pack_ms += zstats.pack_ms;
+                    thread_search_stats.zmq_connect_ms += zstats.connect_ms;
+                    thread_search_stats.zmq_send_ms += zstats.send_ms;
+                    thread_search_stats.zmq_recv_ms += zstats.recv_ms;
+                    thread_search_stats.zmq_unpack_ms += zstats.unpack_ms;
+                }
+
                 res.end();
+            }
+
+#pragma omp critical
+            {
+                combined_search_stats.combine(thread_search_stats);
             }
         }
 
@@ -418,8 +445,12 @@ void hnsw_search(
         InterruptCallback::check();
     }
 
-    HNSWStats hnsw_stats{n1, n2, ndis, nhops};
-    hnsw_stats.combine(hnsw_stats);
+    combined_search_stats.n1 = n1;
+    combined_search_stats.n2 = n2;
+    combined_search_stats.ndis = ndis;
+    combined_search_stats.nhops = nhops;
+    combined_search_stats.nfetch = total_fetches_accum;
+    index->last_search_stats = combined_search_stats;
 }
 
 } // anonymous namespace
@@ -432,17 +463,26 @@ void IndexHNSW::search(
         idx_t* labels,
         const SearchParameters* params) const {
     FAISS_THROW_IF_NOT(k > 0);
+    double search_start_ms = getmillisecs();
 
     using RH = HeapBlockResultHandler<HNSW::C>;
     RH bres(n, distances, labels, k);
 
     hnsw_search(this, n, x, bres, params);
 
+    double postprocess_start_ms = getmillisecs();
     if (is_similarity_metric(this->metric_type)) {
         // we need to revert the negated distances
         for (size_t i = 0; i < k * n; i++) {
             distances[i] = -distances[i];
         }
+    }
+    last_search_stats.postprocess_ms += getmillisecs() - postprocess_start_ms;
+    last_search_stats.total_ms = getmillisecs() - search_start_ms;
+    last_search_stats.final_labels.clear();
+    last_search_stats.final_labels.reserve(k * n);
+    for (size_t i = 0; i < k * n; i++) {
+        last_search_stats.final_labels.push_back(labels[i]);
     }
 }
 
@@ -789,6 +829,82 @@ size_t IndexHNSW::get_last_total_fetch_count() const {
     return fetch_count_ptr->load(std::memory_order_relaxed);
 }
 // ---- End Addition ----
+
+std::string IndexHNSW::get_last_hnsw_search_profile_json() const {
+    const HNSWStats& s = last_search_stats;
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(6);
+    out << "{";
+    out << "\"total_ms\":" << s.total_ms;
+    out << ",\"distance_computer_setup_ms\":" << s.distance_computer_setup_ms;
+    out << ",\"upper_greedy_ms\":" << s.upper_greedy_ms;
+    out << ",\"level0_total_ms\":" << s.level0_total_ms;
+    out << ",\"level0_pop_fetch_ms\":" << s.level0_pop_fetch_ms;
+    out << ",\"level0_dedupe_ms\":" << s.level0_dedupe_ms;
+    out << ",\"level0_pq_ms\":" << s.level0_pq_ms;
+    out << ",\"level0_exact_distance_ms\":" << s.level0_exact_distance_ms;
+    out << ",\"level0_heap_update_ms\":" << s.level0_heap_update_ms;
+    out << ",\"postprocess_ms\":" << s.postprocess_ms;
+    out << ",\"upper_distance_batch_calls\":" << s.upper_distance_batch_calls;
+    out << ",\"upper_requested_nodes_total\":" << s.upper_requested_nodes_total;
+    out << ",\"upper_requested_nodes_unique\":"
+        << s.upper_requested_nodes_unique.size();
+    out << ",\"upper_batch_size_bins\":[";
+    for (size_t i = 0; i < 5; i++) {
+        if (i) out << ",";
+        out << s.upper_batch_size_bins[i];
+    }
+    out << "]";
+    out << ",\"level0_distance_batch_calls\":"
+        << s.level0_distance_batch_calls;
+    out << ",\"level0_requested_nodes_total\":"
+        << s.level0_requested_nodes_total;
+    out << ",\"level0_requested_nodes_unique\":"
+        << s.level0_requested_nodes_unique.size();
+    out << ",\"level0_batch_size_bins\":[";
+    for (size_t i = 0; i < 5; i++) {
+        if (i) out << ",";
+        out << s.level0_batch_size_bins[i];
+    }
+    out << "]";
+    size_t total_unique_nodes = s.upper_requested_nodes_unique.size();
+    std::unordered_set<idx_t> all_recomputed_nodes =
+            s.upper_requested_nodes_unique;
+    all_recomputed_nodes.insert(
+            s.level0_requested_nodes_unique.begin(),
+            s.level0_requested_nodes_unique.end());
+    total_unique_nodes = all_recomputed_nodes.size();
+    size_t total_requested_nodes =
+            s.upper_requested_nodes_total + s.level0_requested_nodes_total;
+    out << ",\"recompute_requested_nodes_total\":" << total_requested_nodes;
+    out << ",\"recompute_requested_nodes_unique\":" << total_unique_nodes;
+    out << ",\"recompute_duplicate_node_requests\":"
+        << (total_requested_nodes > total_unique_nodes
+                    ? total_requested_nodes - total_unique_nodes
+                    : 0);
+    out << ",\"zmq_distance_requests\":" << s.zmq_distance_requests;
+    out << ",\"zmq_distance_nodes_total\":" << s.zmq_distance_nodes_total;
+    out << ",\"zmq_pack_ms\":" << s.zmq_pack_ms;
+    out << ",\"zmq_connect_ms\":" << s.zmq_connect_ms;
+    out << ",\"zmq_send_ms\":" << s.zmq_send_ms;
+    out << ",\"zmq_recv_ms\":" << s.zmq_recv_ms;
+    out << ",\"zmq_unpack_ms\":" << s.zmq_unpack_ms;
+    out << ",\"final_labels\":[";
+    for (size_t i = 0; i < s.final_labels.size(); i++) {
+        if (i) out << ",";
+        out << s.final_labels[i];
+    }
+    out << "]";
+    out << ",\"n_queries\":" << s.n1;
+    out << ",\"ndis\":" << s.ndis;
+    out << ",\"nhops\":" << s.nhops;
+    out << ",\"nfetch\":" << s.nfetch;
+    out << ",\"n_ios\":" << s.n_ios;
+    out << ",\"n_pq_calcs\":" << s.n_pq_calcs;
+    out << ",\"last_total_fetch_count\":" << get_last_total_fetch_count();
+    out << "}";
+    return out.str();
+}
 
 /**************************************************************
  * IndexHNSWFlat implementation

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <string>
 #include <vector>
 
 #include <faiss/IndexFlat.h>
@@ -52,6 +53,7 @@ struct IndexHNSW : Index {
     // use a pointer to an atomic. The pointer can be copied, and each
     // copy gets its own atomic counter.
     mutable std::atomic<size_t>* fetch_count_ptr = nullptr;
+    mutable HNSWStats last_search_stats;
 
     bool is_recompute = false;
 
@@ -133,6 +135,7 @@ struct IndexHNSW : Index {
 
     /// Get the total number of vector fetches performed during the last search.
     size_t get_last_total_fetch_count() const;
+    std::string get_last_hnsw_search_profile_json() const;
 
     void save_edge_stats(const char* filename) const;
 

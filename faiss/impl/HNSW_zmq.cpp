@@ -75,6 +75,12 @@ off_t experimental_disk_data_offset;
 int experimental_block_size;
 std::vector<bool> experimental_is_in_top_degree_set;
 
+double elapsed_ms(
+        const std::chrono::steady_clock::time_point& start,
+        const std::chrono::steady_clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 void* acquire_shared_zmq_context() {
     static void* ctx = nullptr;
     static std::once_flag init_flag;
@@ -515,7 +521,12 @@ bool fetch_distances_zmq(
         const float* query_vector,
         size_t query_dim,
         std::vector<float>& out_distances,
-        int zmq_port = 5557) {
+        int zmq_port = 5557,
+        ZmqFetchStats* stats = nullptr) {
+    if (stats) {
+        stats->distance_requests++;
+        stats->distance_nodes_total += node_ids.size();
+    }
     DistanceRequestMsgpack req_msgpack;
     req_msgpack.node_ids = node_ids;
 
@@ -526,6 +537,7 @@ bool fetch_distances_zmq(
            query_dim * sizeof(float));
 
     std::stringstream buffer;
+    auto stage_start = std::chrono::steady_clock::now();
     try {
         msgpack::pack(buffer, req_msgpack);
     } catch (const std::exception& e) {
@@ -534,6 +546,9 @@ bool fetch_distances_zmq(
         return false;
     }
     std::string req_str = buffer.str();
+    if (stats) {
+        stats->pack_ms += elapsed_ms(stage_start, std::chrono::steady_clock::now());
+    }
 
     void* context = acquire_shared_zmq_context();
     if (!context) {
@@ -553,6 +568,7 @@ bool fetch_distances_zmq(
     zmq_setsockopt(socket, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
     zmq_setsockopt(socket, ZMQ_SNDTIMEO, &timeout, sizeof(timeout));
     std::string endpoint = "tcp://127.0.0.1:" + std::to_string(zmq_port);
+    stage_start = std::chrono::steady_clock::now();
     if (zmq_connect(socket, endpoint.c_str()) != 0) {
         int err = zmq_errno();
         std::cerr << "[ZMQ] zmq_connect(" << endpoint
@@ -561,7 +577,11 @@ bool fetch_distances_zmq(
         zmq_close(socket);
         return false;
     }
+    if (stats) {
+        stats->connect_ms += elapsed_ms(stage_start, std::chrono::steady_clock::now());
+    }
 
+    stage_start = std::chrono::steady_clock::now();
     if (zmq_send(socket, req_str.data(), req_str.size(), 0) < 0) {
         int err = zmq_errno();
         std::cerr << "[ZMQ] zmq_send failed: " << err << " ("
@@ -569,9 +589,13 @@ bool fetch_distances_zmq(
         zmq_close(socket);
         return false;
     }
+    if (stats) {
+        stats->send_ms += elapsed_ms(stage_start, std::chrono::steady_clock::now());
+    }
 
     zmq_msg_t response;
     zmq_msg_init(&response);
+    stage_start = std::chrono::steady_clock::now();
     if (zmq_msg_recv(&response, socket, 0) < 0) {
         int err = zmq_errno();
         std::cerr << "[ZMQ] zmq_msg_recv failed: " << err << " ("
@@ -580,11 +604,15 @@ bool fetch_distances_zmq(
         zmq_close(socket);
         return false;
     }
+    if (stats) {
+        stats->recv_ms += elapsed_ms(stage_start, std::chrono::steady_clock::now());
+    }
 
     DistanceResponseMsgpack resp_msgpack;
     const char* resp_data = static_cast<const char*>(zmq_msg_data(&response));
     size_t resp_size = zmq_msg_size(&response);
 
+    stage_start = std::chrono::steady_clock::now();
     try {
         msgpack::object_handle oh = msgpack::unpack(resp_data, resp_size);
         msgpack::object obj = oh.get();
@@ -595,6 +623,9 @@ bool fetch_distances_zmq(
         zmq_msg_close(&response);
         zmq_close(socket);
         return false;
+    }
+    if (stats) {
+        stats->unpack_ms += elapsed_ms(stage_start, std::chrono::steady_clock::now());
     }
 
     if (resp_msgpack.distances.size() != node_ids.size()) {
@@ -662,7 +693,7 @@ void ZmqDistanceComputer::distances_batch(
         // Call the original ZMQ batch function
         std::vector<float> fetched_distances;
         bool success = fetch_distances_zmq(
-                remote_nodes, query.data(), d, fetched_distances, zmq_port);
+                remote_nodes, query.data(), d, fetched_distances, zmq_port, &zmq_fetch_stats);
 
         bool batch_valid = success &&
                 fetched_distances.size() == remote_nodes.size();

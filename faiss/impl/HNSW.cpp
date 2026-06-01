@@ -16,6 +16,7 @@
 #include <faiss/impl/IDSelector.h>
 #include <faiss/impl/ResultHandler.h>
 #include <faiss/utils/prefetch.h>
+#include <faiss/utils/utils.h>
 
 #include <faiss/impl/platform_macros.h>
 
@@ -1204,6 +1205,7 @@ HNSWStats greedy_update_nearest(
         neighbors_to_process.resize(valid_neighbor_count);
 
         std::vector<float> batch_distances(valid_neighbor_count);
+        stats.record_upper_distance_batch(neighbors_to_process);
         qdis.distances_batch(neighbors_to_process, batch_distances);
         stats.ndis += valid_neighbor_count;
 
@@ -1281,6 +1283,7 @@ HNSWStats HNSW::search(
     if (entry_point == -1) {
         return stats;
     }
+    double search_start_ms = getmillisecs();
     int k = extract_k_from_ResultHandler(res);
 
     bool bounded_queue = this->search_bounded_queue;
@@ -1294,6 +1297,7 @@ HNSWStats HNSW::search(
     }
 
     //  greedy search on upper levels
+    double upper_start_ms = getmillisecs();
     storage_idx_t nearest = entry_point;
     float d_nearest = qdis(nearest);
 
@@ -1303,11 +1307,13 @@ HNSWStats HNSW::search(
                 greedy_update_nearest(*this, qdis, level, nearest, d_nearest);
         stats.combine(local_stats);
     }
+    stats.upper_greedy_ms += getmillisecs() - upper_start_ms;
     if (hnsw_index) {
         // printf("initial fetch count: %ld\n", qdis.get_fetch_count());
     }
 
     int ef = std::max(efSearch, k);
+    double level0_start_ms = getmillisecs();
     if (bounded_queue) { // this is the most common branch
         MinimaxHeap candidates(ef);
 
@@ -1341,8 +1347,10 @@ HNSWStats HNSW::search(
             top_candidates.pop();
         }
     }
+    stats.level0_total_ms += getmillisecs() - level0_start_ms;
 
     vt.advance();
+    stats.total_ms += getmillisecs() - search_start_ms;
 
     return stats;
 }

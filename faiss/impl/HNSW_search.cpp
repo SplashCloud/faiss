@@ -16,6 +16,7 @@
 #include <faiss/impl/ResultHandler.h>
 #include <faiss/utils/distances.h>
 #include <faiss/utils/prefetch.h>
+#include <faiss/utils/utils.h>
 #include "HNSW_zmq.h"
 
 #include <faiss/impl/platform_macros.h>
@@ -422,6 +423,11 @@ int search_from_candidates(
 
     bool local_prune = false;
     float send_neigh_times_ratio = 0;
+    double pq_ms = 0.0;
+    double pop_fetch_ms = 0.0;
+    double dedupe_ms = 0.0;
+    double exact_distance_ms = 0.0;
+    double heap_update_ms = 0.0;
 
     if (params) {
         if (const SearchParametersHNSW* hnsw_params =
@@ -458,6 +464,7 @@ int search_from_candidates(
              (pq_select_ratio < 1 || local_prune ||
               send_neigh_times_ratio != 0));
     // Initialize PQ data if needed
+    double t_stage = getmillisecs();
     if (perform_pq_pruning) {
         size_t dim = hnsw.pq_data_loader->get_dims();
         size_t n_chunks = hnsw.pq_data_loader->get_num_chunks();
@@ -477,6 +484,7 @@ int search_from_candidates(
         pq_code_scratch.resize(max_deg_l0 * hnsw.code_size);
         pq_dists_out.resize(max_deg_l0);
     }
+    pq_ms += getmillisecs() - t_stage;
     neighbor_read_buffer.resize(max_deg_l0);
 
     // Global PQ candidate queue (min-heap)
@@ -541,6 +549,7 @@ int search_from_candidates(
         int total_neighbors = 0;
 
         // 1. Get all beam nodes - either batch mode or fixed beam mode
+        t_stage = getmillisecs();
         if (use_batching) {
             // Batch mode - get nodes until we reach batch_size neighbors
             while (candidates.size() > 0 &&
@@ -627,6 +636,7 @@ int search_from_candidates(
             // printf("get beam_nodes: %d\n", beam_nodes.size());
             // printf("total_neighbors: %d\n", total_neighbors);
         }
+        pop_fetch_ms += getmillisecs() - t_stage;
 
         // Continue if we couldn't pop any valid nodes
         if (beam_nodes.empty()) {
@@ -637,6 +647,7 @@ int search_from_candidates(
         std::set<idx_t> all_new_neighbors_set;
 
         // 2. Process neighbors of all nodes in the beam
+        t_stage = getmillisecs();
         for (size_t b = 0; b < beam_nodes.size(); b++) {
             int v0 = beam_nodes[b];
 
@@ -653,9 +664,11 @@ int search_from_candidates(
                 all_new_neighbors_set.begin(), all_new_neighbors_set.end());
         std::vector<idx_t> nodes_to_compute;
         size_t n_new = unique_new_neighbors.size();
+        dedupe_ms += getmillisecs() - t_stage;
 
         // Calculate PQ distances for unvisited neighbors and add to global PQ
         // queue
+        t_stage = getmillisecs();
         if (perform_pq_pruning) {
             pq_code_scratch.resize(n_new * hnsw.code_size);
             pq_dists_out.resize(n_new);
@@ -772,9 +785,13 @@ int search_from_candidates(
                 }
             }
         }
+        pq_ms += getmillisecs() - t_stage;
 
         std::vector<float> batch_distances(nodes_to_compute.size());
+        t_stage = getmillisecs();
+        stats.record_level0_distance_batch(nodes_to_compute);
         qdis.distances_batch(nodes_to_compute, batch_distances);
+        exact_distance_ms += getmillisecs() - t_stage;
 
         auto add_to_heap = [&](const size_t idx, const float dis) {
             if (!sel || sel->is_member(idx)) {
@@ -788,9 +805,11 @@ int search_from_candidates(
             candidates.push(idx, dis);
         };
 
+        t_stage = getmillisecs();
         for (size_t i = 0; i < nodes_to_compute.size(); i++) {
             add_to_heap(nodes_to_compute[i], batch_distances[i]);
         }
+        heap_update_ms += getmillisecs() - t_stage;
 
         ndis += nodes_to_compute.size();
 
@@ -813,6 +832,11 @@ int search_from_candidates(
         stats.nhops += nstep;
         stats.n_ios = nfetch;
         stats.n_pq_calcs = npq;
+        stats.level0_pop_fetch_ms += pop_fetch_ms;
+        stats.level0_dedupe_ms += dedupe_ms;
+        stats.level0_pq_ms += pq_ms;
+        stats.level0_exact_distance_ms += exact_distance_ms;
+        stats.level0_heap_update_ms += heap_update_ms;
 
         // Periodically dump node visit statistics to a file
         // static const size_t NODE_THRESHOLD =

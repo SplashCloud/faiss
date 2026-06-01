@@ -13,6 +13,26 @@
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/utils/distances.h>
 namespace faiss {
+struct ZmqFetchStats {
+    size_t distance_requests = 0;
+    size_t distance_nodes_total = 0;
+    double pack_ms = 0.0;
+    double connect_ms = 0.0;
+    double send_ms = 0.0;
+    double recv_ms = 0.0;
+    double unpack_ms = 0.0;
+
+    void combine(const ZmqFetchStats& other) {
+        distance_requests += other.distance_requests;
+        distance_nodes_total += other.distance_nodes_total;
+        pack_ms += other.pack_ms;
+        connect_ms += other.connect_ms;
+        send_ms += other.send_ms;
+        recv_ms += other.recv_ms;
+        unpack_ms += other.unpack_ms;
+    }
+};
+
 void setup_experimental_top_degree_disk_read(
         const std::string& degree_path,
         float top_percent,
@@ -43,6 +63,7 @@ struct ZmqDistanceComputer : DistanceComputer {
 
     mutable std::unordered_map<idx_t, std::vector<float>> cached_vectors;
     mutable std::vector<float> last_fetched_vector;
+    mutable ZmqFetchStats zmq_fetch_stats;
 
     const float* get_query() override {
         return query.data();
@@ -89,6 +110,11 @@ struct ZmqDistanceComputer : DistanceComputer {
             cached_vectors.clear();
         }
         last_fetched_vector.clear();
+        zmq_fetch_stats = ZmqFetchStats();
+    }
+
+    ZmqFetchStats get_zmq_fetch_stats() const {
+        return zmq_fetch_stats;
     }
 
     float operator()(idx_t i) override {
